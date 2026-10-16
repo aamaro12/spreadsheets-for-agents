@@ -7,7 +7,7 @@ Pasting a workbook into a prompt loses what makes it a model: the formulas, the 
 | Step | What it returns |
 |---|---|
 | `outline` | Sheets, with hidden ones flagged; blocks of cells with their header rows and row labels; defined names with their values; tables; warnings |
-| `find` | Cells that match some text or a number, allowing for rounding and for how a cell shows it: `1.4` finds 1.38, `12.5%` finds 0.1249 and `1,597` finds 1,597,000 shown in thousands |
+| `find` | Cells that match some text or a number, allowing for rounding, for how a cell shows it and for the units its table states: `1.4` finds 1.38, `12.5%` finds 0.1249, `1,597` finds 1,597,000 shown in thousands and `60.9bn` finds 60,922 in a table in millions |
 | `read` | A range as a grid, with the labels and headers just outside it, and its formulas grouped by the ranges they were filled across |
 | `cell` | One cell in full: shown and stored value, number format, formula, the cells it reads and the formulas that use it |
 | `trace` | The tree of cells behind a figure, down to its inputs, or the formulas that depend on it |
@@ -54,6 +54,15 @@ $ sheetscope find examples/northwind.xlsx 1,597
 | Model!E4 | 1,597 | Revenue | FY2027 | =D4*(1+Growth) |
 ```
 
+Or as a report writes it, in the units the table states (the model's header says £k):
+
+```
+$ sheetscope find examples/northwind.xlsx 1.6m
+| Cell | Shows | Row | Column | Formula |
+|---|---|---|---|---|
+| Model!E4 | 1,597 (in thousands) | Revenue | FY2027 | =D4*(1+Growth) |
+```
+
 Read a slice without losing its headers. A formula filled across a row is shown once:
 
 ```
@@ -97,7 +106,7 @@ $ sheetscope trace examples/northwind.xlsx Summary!B4
 ...
 ```
 
-References can be ranges (`Model!B3:F12`), whole sheets (`Model`), defined names (`Growth`), table references (`Customers[Revenue FY2024]`) or citations (`[northwind.xlsx]Model!D4`). Add `--json` to any step for the full result as JSON.
+References can be ranges (`Model!B3:F12`), whole sheets (`Model`), defined names (`Growth`), table references (`Customers[Revenue FY2024]`) or citations (`[northwind.xlsx]Model!D4`, or `'[model.xlsx]P&L 2025'!B4` and `[model.xlsx]'P&L 2025'!B4` for a sheet name with spaces). Add `--json` to any step for the full result as JSON.
 
 ## Use it from an agent
 
@@ -133,9 +142,9 @@ book.find("1,597")["matches"][0]["citation"]  # '[northwind.xlsx]Summary!B4'
 - **Values are the ones Excel saved.** Nothing is recalculated. A formula saved without its result, for example by a script that wrote the file, is flagged, and the outline warns about it.
 - **Shown values follow the number format**: thousands separators, decimals, percentages, scaling to thousands or millions, currencies, negatives in brackets, dates and durations. Fractions are shown as decimals.
 - **Formulas show as Excel shows them**, without the prefixes the file format adds (`_xlfn.XLOOKUP` is `XLOOKUP`), and are followed across sheets, through 3D references, defined names, table references and whole columns. A trace follows up to 12 formulas inside each range it meets. Cells filled by an array formula or a data table, including a spilled dynamic array, show that formula. INDIRECT, OFFSET and references to a spill (`A1#`) are flagged, because their cells are only known when Excel calculates, and so are references to deleted ranges (`#REF!`). References to other workbooks name the file but are not followed, and a formula that cannot be parsed is noted without stopping the rest.
-- **Labels are reading aids.** A row label is the text in the table's leading text columns, such as `UK / Revenue`, or the date or year that leads each row of a table such as a price history. A column header comes from the nearest header row above: text, dates or consecutive years with figures under them, joined with up to 2 header rows stacked over it, such as `FY2025 / Budget`. A timeline at the top of a sheet heads the sections below it. Placeholders such as NM, n/a and dashes are values, not headers. Cite cells, not labels.
+- **Labels are reading aids.** A row label is the text in the table's leading text columns, such as `UK / Revenue`, after the date or year that leads each row of a table such as a price history or a list of sales by month (`Mar 2024 / North`). A label that repeats in its table starts with the heading of its section, so a filing's `Revenue` rows read `Taiwan / Revenue` and `China (including Hong Kong) / Revenue`. A column header comes from the nearest header row above: text, dates or consecutive years with figures under them, joined with up to 2 header rows stacked over it, such as `FY2025 / Budget`. The header of a list of labels and values stops at a blank row. A timeline at the top of a sheet heads the sections below it. Placeholders such as NM, n/a and dashes are values, not headers. Cite cells, not labels.
 - **Hidden sheets, rows and columns are read and flagged**, so nothing is missed and nothing hidden is mistaken for what a reader sees.
-- **Large workbooks are read in 1 pass.** A 31 MB model with 4.6 million cells and 565,000 formulas loads in 20 s and outlines in 6 s. The outline shows fewer blocks and labels per sheet as a workbook grows, so it stays a few thousand words, and the MCP server keeps the workbooks it read last in memory, up to 8 of them or 10 million cells.
+- **Large workbooks are read in 1 pass.** A 31 MB model with 4.6 million cells and 565,000 formulas loads in 20 s and outlines in 6 s. The outline shows fewer blocks and labels per sheet as a workbook grows, so it stays a few thousand words, and the MCP server keeps the workbooks it read last in memory, up to 8 of them or 10 million cells. Calls that arrive while a workbook is being read wait for that read rather than starting another.
 - **Untrusted files are handled with care.** Only .xlsx and .xlsm files are read. Old .xls files, password-protected files and Excel's lock files are refused with a reason. So is any XML the reader parses that declares a document type, or that is in an encoding which could disguise one, which rules out entity expansion; and so is a file that unpacks to more than 512 MB or holds more than 10 million cells.
 - **Not read:** charts, pivot table definitions, data validation and conditional formats.
 

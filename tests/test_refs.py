@@ -44,6 +44,8 @@ class SheetNameTests(unittest.TestCase):
             "'[Book 1.xlsx]My Sheet'!A1": ("Book 1.xlsx", "My Sheet", "A1"),
             "[northwind.xlsx]Model!D4": ("northwind.xlsx", "Model", "D4"),
             "'[Model [v2] final.xlsx]F'!B1": ("Model [v2] final.xlsx", "F", "B1"),
+            "[Book 1.xlsx]'My Sheet'!A1": ("Book 1.xlsx", "My Sheet", "A1"),  # as agents often write citations
+            "[book.xlsx]'Bob''s'!A1": ("book.xlsx", "Bob's", "A1"),
             "Customers[Revenue]": (None, None, "Customers[Revenue]"),
         }
         for text, parts in cases.items():

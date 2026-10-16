@@ -1,9 +1,11 @@
 """The MCP server offers the same steps as read-only tools, inside one folder."""
 
+import asyncio
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +82,36 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             for name in ("a.xlsx", "b.xlsx", "c.xlsx", "c.xlsx", "b.xlsx", "a.xlsx"):
                 await self.call("outline", path=name)
         self.assertEqual([call.args[0].name for call in reads.call_args_list], ["a.xlsx", "b.xlsx", "c.xlsx", "a.xlsx"])
+
+    async def test_calls_that_arrive_together_read_a_workbook_once(self):
+        def slow(path):
+            time.sleep(0.3)
+            return load(path)
+
+        with patch("sheetscope.server.load", side_effect=slow) as reads:
+            texts = await asyncio.gather(
+                self.call("outline", path="northwind.xlsx"),
+                self.call("find", path="northwind.xlsx", query="1,597"),
+                self.call("cell", path="northwind.xlsx", ref="Model!D4"),
+            )
+        self.assertEqual(reads.call_count, 1)
+        self.assertIn("Model!D4 shows 1,452", texts[2])
+
+    async def test_a_read_that_fails_is_shared_and_tried_again_later(self):
+        (self.root / "bad.xlsx").write_bytes(b"PK not a workbook")
+
+        def slow(path):
+            time.sleep(0.3)
+            return load(path)
+
+        with patch("sheetscope.server.load", side_effect=slow) as reads:
+            results = await asyncio.gather(
+                *(self.call("outline", path="bad.xlsx") for _ in range(2)), return_exceptions=True
+            )
+        self.assertEqual(reads.call_count, 1)
+        self.assertTrue(all(isinstance(r, ToolError) and "damaged" in str(r) for r in results), results)
+        northwind.build(self.root / "bad.xlsx")
+        self.assertIn("## Model", await self.call("outline", path="bad.xlsx"))
 
     async def test_lock_files_hidden_files_and_links_out_are_not_listed(self):
         (self.root / "~$northwind.xlsx").write_bytes(b"lock")

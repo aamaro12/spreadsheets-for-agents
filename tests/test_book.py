@@ -1,7 +1,10 @@
 """Each reading step on saved workbooks: what it shows, what it cites and how it fails."""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 import re
+import time
 from unittest.mock import patch
 import zipfile
 
@@ -51,6 +54,12 @@ class LoadTests(WorkbookCase):
         for path, reason in cases.items():
             with self.subTest(path.name), self.assertRaisesRegex(SheetError, reason):
                 load(path)
+
+    def test_a_folder_is_refused_by_its_name(self):
+        for path, name in ((self.folder, self.folder.name), (Path("."), Path.cwd().name)):
+            with self.subTest(path=str(path)), self.assertRaises(SheetError) as caught:
+                load(path)
+            self.assertEqual(str(caught.exception), f"{name} is a folder, not a workbook")
 
     def test_xml_that_declares_entities_is_refused_in_any_part(self):
         for part, root in (
@@ -368,6 +377,59 @@ class FindTests(WorkbookCase):
             self.book.find("  ")
 
 
+class UnitTests(WorkbookCase):
+    """Figures quoted as in a report, such as 60.9bn, find cells kept in the units a heading states."""
+
+    def setUp(self):
+        super().setUp()
+        book = Workbook()
+        pl = book.active
+        pl.title = "P&L"
+        pl["A1"] = "Income statement (£k)"
+        pl.append([])
+        pl.append([None, "FY2024", "FY2025"])
+        pl.append(["Revenue", 3614, 3900])
+        segments = book.create_sheet("Segments")
+        segments.append(["Segment revenue - USD ($) $ in Millions", "12 Months Ended"])
+        segments.append([None, "Jan. 28, 2024"])
+        segments.append(["Revenue", 60922])
+        segments["B3"].number_format = "#,##0"
+        segments.append(["Diluted (in USD per share)", 11.93])
+        summary = book.create_sheet("Summary")
+        summary.append(["Metric", "FY2027"])
+        summary.append(["Revenue (£m)", 14650.69])
+        summary["B2"].number_format = '#,##0.0,"m"'
+        raw = book.create_sheet("Raw")
+        raw.append(["Cash", 3600000])
+        raw.append(["Debt", 3600])
+        self.book = load(self.save(book))
+
+    def test_figures_with_units_find_cells_in_the_units_stated(self):
+        cases = {
+            "3.6m": ["P&L!B4", "Raw!B1"],
+            "£3.6m": ["P&L!B4", "Raw!B1"],
+            "3.9 million": ["P&L!C4"],
+            "60.9bn": ["Segments!B3"],
+            "$60.9 billion": ["Segments!B3"],
+            "$60.9b": ["Segments!B3"],
+            "14.7m": ["Summary!B2"],
+        }
+        for query, cells in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(sorted(refs(self.book.find(query))), cells)
+
+    def test_a_match_through_stated_units_says_so(self):
+        match = self.book.find("60.9bn")["matches"][0]
+        self.assertEqual((match["display"], match["units"]), ("60,922", "millions"))
+        self.assertIn("60,922 (in millions)", markdown(self.book.find("60.9bn")))
+        self.assertNotIn("units", self.book.find("3.6m")["matches"][-1])  # Raw!B1 holds the whole figure
+
+    def test_figures_per_share_and_plain_numbers_are_not_scaled(self):
+        self.assertEqual(refs(self.book.find("11.9m")), [])
+        self.assertEqual(refs(self.book.find("3,614")), ["P&L!B4"])
+        self.assertEqual(refs(self.book.find("3.6")), [])
+
+
 class ReadTests(WorkbookCase):
     def setUp(self):
         super().setUp()
@@ -431,6 +493,52 @@ class CellTests(WorkbookCase):
         reads = [(item["ref"], item.get("via"), item["display"]) for item in cell["precedents"]]
         self.assertEqual(reads, [("Model!C4", None, "1,320"), ("Inputs!B4", "Growth", "10.0%")])
         self.assertEqual(cell["dependents"], ["Summary!D4", "Model!E4", "Model!D5", "Model!E5", "Model!D6", "Model!D9"])
+
+    def test_the_formulas_that_use_cells_are_indexed_once_for_calls_at_the_same_time(self):
+        book = load(self.northwind())
+        index, built = book._index_users, []
+
+        def slow():
+            built.append(1)
+            time.sleep(0.2)
+            return index()
+
+        book._index_users = slow
+        with ThreadPoolExecutor(3) as pool:
+            users = list(pool.map(lambda _: book.cell("Model!D4")["dependents"], range(3)))
+        self.assertEqual(len(built), 1)
+        self.assertEqual(users[0], users[2])
+
+    def test_cells_in_ranges_of_every_shape_know_the_formulas_that_read_them(self):
+        book = Workbook()
+        data = book.active
+        data.title = "Data"
+        for row in range(1, 81):
+            data.append([row * 100 + col for col in range(1, 81)])
+        calc = book.create_sheet("Calc")
+        formulas = {
+            "A1": "=SUM(Data!B5:J5)",  # wide: one row
+            "A2": "=SUM(Data!C2:C49)",  # tall: one column
+            "A3": "=SUM(Data!B2:D4)",  # a small square
+            "A4": "=SUM(Data!A1:BZ80)",  # too wide to file by column or row
+            "A5": "=SUM(Data!E:E)",  # a whole column
+            "A6": "=SUM(Data!7:7)",  # a whole row
+            "A7": "=Data!C3",
+        }
+        for ref, formula in formulas.items():
+            calc[ref] = formula
+        loaded = load(self.save(book, {"Calc": {ref: 0 for ref in formulas}}))
+        cases = {
+            "Data!F5": ["Calc!A1", "Calc!A4"],
+            "Data!C30": ["Calc!A2", "Calc!A4"],
+            "Data!C3": ["Calc!A2", "Calc!A3", "Calc!A4", "Calc!A7"],
+            "Data!E7": ["Calc!A4", "Calc!A5", "Calc!A6"],
+            "Data!K5": ["Calc!A4"],
+            "Data!CA1": [],
+        }
+        for ref, users in cases.items():
+            with self.subTest(ref=ref):
+                self.assertEqual(loaded.cell(ref)["dependents"], users)
 
     def test_an_input_shows_its_comment_and_users(self):
         cell = self.book.cell("Growth")
@@ -507,6 +615,11 @@ class ReferenceTests(WorkbookCase):
         self.assertEqual(self.book.cell("'P&L 2025'!B7")["precedents"][0]["via"], "Rate")
         self.assertEqual(self.book.read("Jan!Rate")["range"], "B2")
         self.assertEqual(self.book.cell("'[book.xlsx]P&L 2025'!B1")["citation"], "'[book.xlsx]P&L 2025'!B1")
+
+    def test_a_citation_with_its_sheet_quoted_after_the_workbook_is_read(self):
+        cell = self.book.cell("[book.xlsx]'P&L 2025'!B1")
+        self.assertEqual((cell["sheet"], cell["cell"]), ("P&L 2025", "B1"))
+        self.assertEqual(self.book.read("[book.xlsx]'Jan'!B2:C2")["range"], "B2:C2")
 
     def test_names_that_are_constants_or_deleted_say_so(self):
         cases = {

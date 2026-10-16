@@ -25,7 +25,11 @@ def main(argv=None) -> int:
         return command
 
     step("outline", "Sheets, blocks, header rows, row labels, defined names and tables")
-    find = step("find", "Cells whose text or shown value contains the query, or whose number rounds to it")
+    find = step(
+        "find",
+        "Cells whose text or shown value contains the query, or whose number rounds to it, also in the units "
+        "a heading states: 60.9bn finds 60,922 in millions",
+    )
     find.add_argument("query")
     find.add_argument("--sheet", help="search one sheet only")
     find.add_argument("--formulas", action="store_true", help="search formula text instead of values")

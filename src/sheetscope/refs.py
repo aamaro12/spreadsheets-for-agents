@@ -105,6 +105,8 @@ def split_ref(text: str) -> tuple[str | None, str | None, str]:
     book = None
     if prefix.startswith("[") and "]" in prefix:
         book, prefix = prefix[1:].rsplit("]", 1)
+        if len(prefix) > 1 and prefix[0] == prefix[-1] == "'":  # [book.xlsx]'Sheet 1'!A1, as agents write it
+            prefix = prefix[1:-1].replace("''", "'")
     return book, prefix or None, ref
 
 

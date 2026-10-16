@@ -1,12 +1,15 @@
 """Where a sheet's labels are: blocks of cells, header rows, row labels and column headers.
 
 These are reading aids, not facts stored in the file. A row label is the text in its block's
-leading text columns, to the left of the cell, or the date or year that leads its row. A column
-header comes from the nearest header row above: text, dates or consecutive years with values
-below them, joined with the header rows stacked directly above it. Placeholders such as NM and
-n/a are values, not headings. A list of text alone takes its own first row.
+leading text columns, to the left of the cell, after the date or year that leads its row; a label
+that repeats in its block, such as Revenue under each region of a filing, starts with the heading
+of its section. A column header comes from the nearest header row above: text, dates or consecutive
+years with values below them, joined with the header rows stacked directly above it. The header of
+a list of labels and values stops at a blank row. Placeholders such as NM and n/a are values, not
+headings. A list of text alone takes its own first row.
 """
 
+from bisect import bisect_left
 from collections import Counter, defaultdict
 
 from .refs import Area
@@ -42,6 +45,7 @@ class Layout:
         self._rows: list[list[int]] = []
         self._row_sets: list[set[int]] = []
         self._heads, self._labels, self._figures, self._above, self._like = {}, {}, {}, {}, {}
+        self._sections: dict[int, dict[int, int]] = {}  # each block's rows that take a section heading
         self._keyed: set[int] = set()  # blocks whose rows are labelled by a leading date or year
         self._dated_from: dict[int, int | None] = {}  # each block's first row of dates or years
         self._group()
@@ -149,6 +153,8 @@ class Layout:
         heads = self.header_rows(block)
         for top in reversed(heads):
             if top < row and (found := self.headings(block, top, col)):
+                if len(self._in_row(block, top)) == 2 and self._gap(block, top, row):
+                    return []  # the header of a list of labels and values heads it down to a blank row
                 return found
         if heads:
             return []
@@ -171,13 +177,52 @@ class Layout:
             block = self.block.get((row, col))
         if block is not None and (columns := self.label_columns(block)):
             kinds = ("date", "number") if block in self._keyed else ()
-            return [(row, c) for c in columns if c < col and self._text((row, c), *kinds)][:3]
+            found = [(row, c) for c in columns if c < col and self._text((row, c), *kinds)][:3]
+            if found and (heading := self.sections(block).get(row)):
+                found.insert(0, (heading, columns[0]))
+            return found
         limit = self.areas[block].min_col if block is not None else col
         texts = [c for c in self.rows.get(row, ()) if c < limit and self._text((row, c))]
         if not texts:
             return []
         nearest = self.block[(row, texts[-1])]
         return [(row, c) for c in self.label_columns(nearest) or [texts[-1]] if self._text((row, c))][:3]
+
+    def sections(self, block: int) -> dict[int, int]:
+        """Rows whose label repeats in the block, each with the heading of its section: the nearest row above
+        with a label and no values, whose text is not itself repeated (as a filing repeats "Revenues")."""
+        if block not in self._sections:
+            columns, found = self.label_columns(block), {}
+            if columns and block not in self._keyed:
+                first, cells, rest = columns[0], self.cells, columns[1:]
+                banded = {r for top in self.header_rows(block) for r in self.band(block, top)}
+                keyed = []  # (row, its label, whether it holds values)
+                for r in self._rows[block]:
+                    cell = cells.get((r, first))
+                    if r in banded or cell is None or cell.kind != "text" or (key := _key(cell)) in PLACEHOLDERS:
+                        continue
+                    label = (key, *(_key(cells.get((r, c))) for c in rest)) if rest else key
+                    keyed.append((r, label, self._valued(block, r)))
+                repeats = Counter(label for _, label, valued in keyed if valued)
+                if any(count > 1 for count in repeats.values()):
+                    headings = Counter(label for _, label, valued in keyed if not valued)
+                    heading = None
+                    for r, label, valued in keyed:
+                        if not valued:
+                            if headings[label] == 1:
+                                heading = r
+                        elif heading is not None and repeats[label] > 1:
+                            found[r] = heading
+            self._sections[block] = found
+        return self._sections[block]
+
+    def _valued(self, block, row):
+        return any(self.block[(row, c)] == block and self.cells[(row, c)].kind in VALUES for c in self.rows[row])
+
+    def _gap(self, block, top, row):
+        """Whether a blank row lies between two rows of a block."""
+        rows = self._rows[block]
+        return bisect_left(rows, row) - bisect_left(rows, top) != row - top
 
     def label_columns(self, block: int) -> list[int]:
         """The block's first run of columns holding more text than values, outside its header rows and
@@ -202,8 +247,12 @@ class Layout:
             else:
                 if values_before:
                     run = []  # text after all the values is notes, not labels
-            if not run and counts and self._key_column(block, min(counts), banded):
-                run = [min(counts)]
+            lead = min(counts) if counts else None
+            if run and run[0] == lead + 1 and self._key_column(block, lead, banded):
+                run.insert(0, lead)  # a date before the text, as in Month | Region | Revenue
+                self._keyed.add(block)
+            elif not run and counts and self._key_column(block, lead, banded):
+                run = [lead]
                 self._keyed.add(block)
             self._labels[block] = run
         return self._labels[block]
@@ -348,6 +397,10 @@ class Layout:
         if cell.kind == "text":
             return str(cell.value).strip().casefold() not in PLACEHOLDERS
         return cell.kind in kinds
+
+
+def _key(cell):
+    return str(cell.value).strip().casefold() if cell is not None else ""
 
 
 def _year(value):

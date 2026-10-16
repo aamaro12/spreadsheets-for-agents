@@ -99,7 +99,8 @@ def _find(result):
     lines.append("|---|---|---|---|" + ("---|" if with_formulas else ""))
     for m in matches:
         ref = _text(f"{quote(m['sheet'])}!{m['cell']}") + (f" (hidden {m['hidden']})" if m.get("hidden") else "")
-        cells = [ref, _shown(m), _text(m.get("label", ""), 60), _text(m.get("header", ""), 60)]
+        shown = _shown(m) + (f" (in {m['units']})" if m.get("units") else "")
+        cells = [ref, shown, _text(m.get("label", ""), 60), _text(m.get("header", ""), 60)]
         if with_formulas:
             cells.append(_text(m.get("formula", "")))
         lines.append("| " + " | ".join(cells) + " |")

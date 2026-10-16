@@ -199,6 +199,21 @@ class HeaderTests(unittest.TestCase):
         table = grid([["Item", "Amount"], ["Rent", 100], ["Rates", 40]])
         self.assertEqual(text(table, table.header(3, 2)), "Amount")
 
+    def test_a_label_and_value_header_stops_at_a_blank_row(self):
+        inputs = grid(
+            [
+                ["Scenario", "Revenue growth"],
+                ["Base", 0.06],
+                ["Upside", 0.11],
+                [],
+                ["Gross margin", 0.38],
+                ["Tax rate", 0.25],
+            ]
+        )
+        self.assertEqual(text(inputs, inputs.header(3, 2)), "Revenue growth")
+        self.assertIsNone(text(inputs, inputs.header(5, 2)))
+        self.assertIsNone(text(inputs, inputs.header(6, 2)))
+
     def test_a_header_row_apart_from_its_figures_still_heads_them(self):
         months = [datetime(2024, m, 28) for m in (1, 2, 3)]
         apart = grid([[None, *months], [], [], ["Revenue", 10, 11, 12], ["Costs", 5, 6, 7]])
@@ -390,6 +405,53 @@ class LabelTests(unittest.TestCase):
             ]
         )
         self.assertEqual(text(runway, runway.label(1, 4)), "Capital raised")
+
+    def test_a_label_that_repeats_takes_the_heading_of_its_section(self):
+        filing = grid(
+            [
+                ["Revenue by region (Details)", "FY2024", "FY2023"],
+                ["Revenues"],
+                ["Revenue", 60922, 26974],
+                ["United States"],
+                ["Revenues"],
+                ["Revenue", 26966, 8292],
+                ["Taiwan"],
+                ["Revenues"],
+                ["Revenue", 13405, 6986],
+                ["Operating income", 32972, 4224],
+            ]
+        )
+        expected = {3: "Revenue", 6: "United States / Revenue", 9: "Taiwan / Revenue", 10: "Operating income"}
+        for row, label in expected.items():
+            with self.subTest(row=row):
+                self.assertEqual(text(filing, filing.label(row, 2)), label)
+        accounts = grid(
+            [
+                ["£k", "FY2024"],
+                ["Revenue"],
+                ["Product", 100],
+                ["Services", 50],
+                ["Total", 150],
+                ["Costs"],
+                ["Staff", 60],
+                ["Total", 60],
+            ]
+        )
+        self.assertEqual(
+            [text(accounts, accounts.label(r, 2)) for r in (3, 5, 8)], ["Product", "Revenue / Total", "Costs / Total"]
+        )
+
+    def test_a_table_led_by_dates_and_text_takes_both_as_row_labels(self):
+        sales = grid(
+            [
+                ["Month", "Region", "Revenue"],
+                [datetime(2024, 1, 1), "North", 310],
+                [datetime(2024, 1, 1), "South", 265],
+                [datetime(2024, 2, 1), "North", 320],
+            ]
+        )
+        self.assertEqual(text(sales, sales.label(4, 3)), "2024-02-01 00:00:00 / North")
+        self.assertEqual(text(sales, sales.header(4, 3)), "Revenue")
 
     def test_labels_above_a_table_further_down_the_block_are_kept(self):
         rates = grid(

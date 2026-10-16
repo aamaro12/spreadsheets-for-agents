@@ -2,11 +2,12 @@
 
 from datetime import date, datetime, time, timedelta
 import difflib
-from functools import cached_property
+from functools import cached_property, lru_cache
 import hashlib
 import io
 from pathlib import Path
 import re
+import threading
 from typing import NamedTuple
 import zipfile
 import zlib
@@ -30,8 +31,23 @@ _ITEM = re.compile(r"\[((?:[^\[\]']|'.)*)\]")
 _SCALES = (1e-3, 1e-6, 1e-9, 1e-12, 100)  # thousands, millions, billions and trillions, and percentages
 _QUOTED_FIGURE = re.compile(r"(\d[\d,]*(?:\.\d+)?|\.\d+)")
 _QUERY_NUMBER = re.compile(
-    r"(?P<sign>[-+])?(?P<open>\()?[£$€¥]?(?P<whole>\d{1,3}(?:,\d{3})+|\d+)?(?P<fraction>\.\d+)?(?P<percent>%)?(?P<close>\))?"
+    r"(?P<sign>[-+])?(?P<open>\()?[£$€¥]?(?P<whole>\d{1,3}(?:,\d{3})+|\d+)?(?P<fraction>\.\d+)?"
+    r"(?P<scale>k|thousands?|m|mn|mm|mln|millions?|bn?|billions?|tn|trillions?)?(?P<percent>%)?(?P<close>\))?"
 )
+_SCALE_OF = {"k": 1e3, "thousand": 1e3, "thousands": 1e3, "m": 1e6, "mn": 1e6, "mm": 1e6, "mln": 1e6, "million": 1e6}
+_SCALE_OF |= {"millions": 1e6, "b": 1e9, "bn": 1e9, "billion": 1e9, "billions": 1e9, "tn": 1e12, "trillion": 1e12}
+_SCALE_OF |= {"trillions": 1e12}
+# Units a heading or label states, such as (£k), $m, € in millions or USD 000s
+_STATED = {
+    "thousands": r"\bin thousands\b|\bthousands\b|\(\s*[£$€¥]?\s*(?:k|000s?|'000s?)\s*\)|[£$€¥]\s?(?:k|'?000s?)\b"
+    r"|\b(?:usd|gbp|eur|chf|jpy)\s?(?:k|'?000s?)\b|'000s?\b",
+    "millions": r"\bin millions\b|\bmillions\b|\(\s*[£$€¥]?\s*(?:m|mn|mm|mln)\s*\)|[£$€¥]\s?(?:m|mn|mm|mln)\b"
+    r"|\b(?:usd|gbp|eur|chf|jpy)\s?(?:m|mn|mm|mln)\b",
+    "billions": r"\bin billions\b|\bbillions\b|\(\s*[£$€¥]?\s*bn?\s*\)|[£$€¥]\s?bn\b|\b(?:usd|gbp|eur|chf|jpy)\s?bn\b",
+}
+_STATED_UNITS = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in _STATED.items()))
+_UNIT_SIZE = {"thousands": 1e3, "millions": 1e6, "billions": 1e9}
+_UNSCALED = re.compile(r"per share|per unit|\beps\b|%|\bratio\b")  # figures no unit multiplies
 
 
 class SheetError(Exception):
@@ -125,6 +141,8 @@ class Target(NamedTuple):
 def load(path) -> "Book":
     """Read a workbook's formulas and saved values. Raises SheetError with a reason a reader can act on."""
     path = Path(path)
+    if path.is_dir():
+        raise SheetError(f"{path.resolve().name or path} is a folder, not a workbook")
     if path.suffix.lower() not in SUFFIXES:
         raise SheetError(f"{path.name} is not an .xlsx or .xlsm workbook")
     try:
@@ -191,6 +209,9 @@ class Book:
         self._inputs_of: dict = {}
         self._read_by: dict = {}  # what a formula's text reads on a sheet
         self._users_index: dict | None = None
+        self._indexing = threading.Lock()  # tool calls run in threads; the index is built once
+        self._block_units: dict = {}  # units stated at the top of each block, and of each sheet
+        self._unit_sheets: dict[str, bool] = {}  # whether any text on a sheet states units
 
     # Loading
 
@@ -281,16 +302,26 @@ class Book:
 
     def find(self, query: str, sheet: str | None = None, formulas: bool = False, limit: int = FIND_LIMIT) -> dict:
         """Cells whose text or shown value contains the query, or whose number, as stored or as shown, rounds
-        to it: "12.5%" finds 0.1249, and "1,597" finds 1,597,000 shown in thousands."""
+        to it: "12.5%" finds 0.1249, and "1,597" finds 1,597,000 shown in thousands. A figure with units, such
+        as "60.9bn", also finds 60,922 where a label, header or title states millions."""
         needle = query.strip().casefold()
         if not needle:
             raise SheetError("Give some text or a number to find")
         number = None if formulas else _query_number(needle)
+        scaled = number is not None and number[2]
         sheets = [self._sheet_or_error(sheet)] if sheet else list(self.sheets.values())
-        hits = []
+        hits, units = [], {}
         for order, page in enumerate(sheets):
+            stated = scaled and self._states_units(page)
             for (row, col), cell in page.cells.items():
                 rank = _rank(cell, needle, number, formulas)
+                if (
+                    rank is None
+                    and stated
+                    and cell.kind == "number"
+                    and (unit := self._in_units(page, row, col, number))
+                ):
+                    rank, units[(order, row, col)] = 1, unit
                 if rank is not None:
                     hits.append((rank, order, row, col))
         hits.sort()
@@ -302,7 +333,9 @@ class Book:
             "query": query.strip(),
             "searched": "formulas" if formulas else "values",
             "total": len(hits),
-            "matches": [self._info(sheets[order], row, col) for _, order, row, col in shown],
+            "matches": [
+                self._match(sheets[order], row, col, units.get((order, row, col))) for _, order, row, col in shown
+            ],
         }
 
     def read(self, ref: str, max_cells: int = READ_CELLS) -> dict:
@@ -574,32 +607,91 @@ class Book:
             self._inputs_of[key] = self._read_by[(sheet, formula)]
         return self._inputs_of[key]
 
+    def _match(self, sheet, row, col, units):
+        info = self._info(sheet, row, col)
+        if units:
+            info["units"] = units
+        return info
+
+    def _in_units(self, sheet, row, col, number) -> str | None:
+        """The units a heading or label states for a figure, when the figure in those units is the query's,
+        such as 60,922 in a table in millions for "60.9bn"."""
+        target, tolerance, _ = number
+        cell = sheet.cells[(row, col)]
+        sizes = [size for size in _UNIT_SIZE.values() if abs(cell.value * size - target) <= tolerance]
+        if not sizes or "%" in (cell.format or ""):
+            return None
+        layout = sheet.layout
+        label = _joined(sheet, layout.label(row, col))
+        if _UNSCALED.search(label.casefold()):
+            return None
+        name = _stated(label) or _stated(_joined(sheet, layout.header(row, col)))
+        if name is None:
+            name = self._units_above(sheet, layout.block.get((row, col)))
+        return name if name and _UNIT_SIZE[name] in sizes else None
+
+    def _states_units(self, sheet):
+        if sheet.name not in self._unit_sheets:
+            texts = (cell.value for cell in sheet.cells.values() if cell.kind == "text")
+            self._unit_sheets[sheet.name] = any(_stated(text) for text in texts)
+        return self._unit_sheets[sheet.name]
+
+    def _units_above(self, sheet, block):
+        """The units stated in the first rows of a block, such as its title, or else at the top of its sheet."""
+        if (sheet.name, block) not in self._block_units:
+            layout, name = sheet.layout, None
+            if block is not None:
+                for r in layout.rows_of(block)[:6]:
+                    texts = (sheet.cells[(r, c)].display for c in layout.rows[r] if layout.block[(r, c)] == block)
+                    if name := next(filter(None, map(_stated, texts)), None):
+                        break
+            if name is None and block is not None:
+                name = self._units_above(sheet, None)
+            elif block is None:
+                top = sorted(layout.rows)[:3]
+                name = next(
+                    filter(None, (_stated(sheet.cells[(r, c)].display) for r in top for c in layout.rows[r][:3])), None
+                )
+            self._block_units[(sheet.name, block)] = name
+        return self._block_units[(sheet.name, block)]
+
     def _users(self, sheet: str, position) -> list[tuple[str, tuple[int, int]]]:
         """The formula cells that read a cell, in workbook order. The index is built on first use: what reads
-        each single cell, then ranges by column, then ranges too wide to file by column."""
+        each single cell, then ranges by column or by row, whichever they span fewer of, then ranges too
+        large to file either way."""
         if self._users_index is None:
-            index = {}
-            for page in self.sheets.values():
-                for place, cell in page.cells.items():
-                    if cell.formula:
-                        for target in self._inputs(page.name, place)[0]:
-                            cells, columns, wide = index.setdefault(target.sheet, ({}, {}, []))
-                            user, area = (page.name, place), target.area
-                            if area.size == 1:
-                                cells.setdefault((area.min_row, area.min_col), []).append(user)
-                            elif area.max_col - area.min_col < 64:
-                                for col in range(area.min_col, area.max_col + 1):
-                                    columns.setdefault(col, []).append((area, user))
-                            else:
-                                wide.append((area, user))
-            self._users_index = index
+            with self._indexing:
+                if self._users_index is None:
+                    self._users_index = self._index_users()
         if sheet not in self._users_index:
             return []
-        cells, columns, wide = self._users_index[sheet]
+        cells, columns, rows, wide = self._users_index[sheet]
         found = set(cells.get(position, ()))
         found.update(user for area, user in columns.get(position[1], ()) if area.covers(*position))
+        found.update(user for area, user in rows.get(position[0], ()) if area.covers(*position))
         found.update(user for area, user in wide if area.covers(*position))
         return sorted(found, key=lambda user: (self._order[user[0]], user[1]))
+
+    def _index_users(self) -> dict:
+        index = {}
+        for page in self.sheets.values():
+            for place, cell in page.cells.items():
+                if cell.formula:
+                    for target in self._inputs(page.name, place)[0]:
+                        cells, columns, rows, wide = index.setdefault(target.sheet, ({}, {}, {}, []))
+                        user, area = (page.name, place), target.area
+                        height, width = area.max_row - area.min_row + 1, area.max_col - area.min_col + 1
+                        if area.size == 1:
+                            cells.setdefault((area.min_row, area.min_col), []).append(user)
+                        elif height < width and height <= 64:  # B5:J5 is filed once, under row 5
+                            for row in range(area.min_row, area.max_row + 1):
+                                rows.setdefault(row, []).append((area, user))
+                        elif width <= 64:
+                            for col in range(area.min_col, area.max_col + 1):
+                                columns.setdefault(col, []).append((area, user))
+                        else:
+                            wide.append((area, user))
+        return index
 
     # Helpers
 
@@ -706,13 +798,16 @@ class Book:
             if len(columns) > max_columns:
                 info["more_columns"] = len(columns) - max_columns
             start = top + 1
-        labels = []
+        labels, more = [], 0
         for row in rows:
             if row >= start and (positions := layout.label(row, area.max_col + 1, block)):
-                labels.append({"row": row, "text": _joined(sheet, positions)})
-        info["labels"] = labels[:max_labels]
-        if len(labels) > max_labels:
-            info["more_labels"] = len(labels) - max_labels
+                if len(labels) < max_labels:
+                    labels.append({"row": row, "text": _joined(sheet, positions)})
+                else:
+                    more += 1  # counted, not written out
+        info["labels"] = labels
+        if more:
+            info["more_labels"] = more
         return info
 
     def _name_info(self, name: Name) -> dict:
@@ -780,6 +875,8 @@ def _query_number(text):
     match = _QUERY_NUMBER.fullmatch(text.replace(" ", ""))
     if not match or not (match["whole"] or match["fraction"]) or bool(match["open"]) != bool(match["close"]):
         return None
+    if match["scale"] and match["percent"]:
+        return None
     fraction = match["fraction"] or ""
     value = float((match["whole"] or "0").replace(",", "") + fraction)
     tolerance = 0.5 * 10 ** -max(len(fraction) - 1, 0)
@@ -787,7 +884,16 @@ def _query_number(text):
         value = -value
     if match["percent"]:
         value, tolerance = value / 100, tolerance / 100
-    return value, tolerance * (1 + 1e-9)
+    if scale := match["scale"]:
+        value, tolerance = value * _SCALE_OF[scale], tolerance * _SCALE_OF[scale]
+    return value, tolerance * (1 + 1e-9), bool(scale)
+
+
+@lru_cache(maxsize=65536)
+def _stated(text):
+    """The units a piece of text states first: thousands, millions or billions, or None."""
+    found = min(_STATED_UNITS.finditer(text.casefold()), key=lambda m: m.start(), default=None)
+    return found.lastgroup if found else None
 
 
 def _rank(cell, needle, number, formulas):
@@ -809,9 +915,11 @@ def _rank(cell, needle, number, formulas):
 def _rank_number(cell, needle, number):
     """0 when a number cell shows the query, 1 when its value or the number it shows rounds to it: 1,597,000
     shown in thousands as 1,597 matches "1,597". Digits inside a longer number do not match."""
-    target, tolerance = number
+    target, tolerance, scaled = number
     if abs(cell.value - target) <= tolerance:
         return 0 if cell.display.casefold() == needle else 1
+    if scaled and formats.may_show(needle, cell.format) and cell.display.casefold() == needle:
+        return 0  # 14,650 in £k shown as 14.7m
     if not any(abs(cell.value * scale - target) <= tolerance + 0.5 for scale in _SCALES):
         return None  # no format could show a number this close to the query
     shown = cell.display.casefold()
